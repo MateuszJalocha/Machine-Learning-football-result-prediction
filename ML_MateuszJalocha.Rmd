@@ -1,0 +1,909 @@
+---
+title: "ML_MateuszJalocha"
+author: "Mateusz Jalocha"
+date: "26 stycznia 2019"
+output:
+  html_document:
+    code_folding: hide
+    
+---
+
+## 1. Wstęp
+Rynek zakładów bukmacherskich w samej Polsce jest wart około 5 mld zł, a setki tysięcy "graczy" zmaga się z problemem jak obstawiać tak, aby zmaksymalizować zyski. Niniejszy projekt dotyczy meczów piłkarskich, a dokładniej rzecz biorąc, meczów Szkockiej Premier League, czyli najwyższej ligi rozgrywkowej w tym kraju. W związku z dużą liczbą zmiennych wpływających na wynik meczu oraz tym jak nieprzewidywalnym sportem jest piłka nożna, skomponowanie dobrego modelu jest niesamowicie trudne. Postaram się w tej stworzyć modele przy pomocy trzech metod: KNN, Naiwny Klasyfikator Bayesa oraz Random Forest, przy pomocy których będzie możliwe przewidywanie czy gospodarz zwycięży w tym meczu, w przeciwnym przypadku mecz wygra gość lub padnie remis. Projekt jest ciekawy o tyle, że w przypadku dobrych wyników, modele będą mogły wspomagać podejmowanie decyzji dotyczącej zakładów bukmacherskich. W pracy w miejscach, które uznałem za zawierające ciekawy kod znajdują się przyciski code, po naciśnięciu których naciśnięciu się ukaże.
+
+```{r  include=FALSE, echo = FALSE}
+library(mlr) 
+library(boot)
+library(naivebayes)
+library(e1071)
+library(class)
+library(pROC) #Krzywa ROC
+library(xgboost) # Dla xgboost
+library(tidyverse) # Generalnie użyteczne funkcje
+library(ggplot2) #Plots
+library('rvest') #Webscrapping
+library(corrplot) #Macierz korelacji
+library(gridExtra) #Tabelki
+library(flextable)
+library(officer)
+library(kableExtra)
+library(TSdist)
+library(psych)
+library(randomForest)
+library(reshape2)
+library(gridExtra)
+library(rpart)
+library(rpart.plot)
+library(caTools)
+library(caret)
+```
+
+```{r , include=FALSE, echo = FALSE}
+#Utworzenie tabeli przy wykorzystaniu biblioteki regulartable
+frame_func <- function(frame) {
+  big_b <- fp_border(color="gray70", width = 1)
+  std_b <- fp_border(color="gray70")
+  
+  frame %>% 
+    regulartable() %>% 
+    autofit() %>% 
+    width(width = 2) %>% 
+    fontsize(part = "all", size = 15) %>% 
+    align(part = "all", align = "center") %>% 
+    vline(border = big_b, part = "all" ) %>%
+    vline_left(border = big_b, part = "all" ) %>% 
+    vline_right(border = big_b, part = "all" ) %>% 
+    hline(border = std_b ) %>% 
+    hline_bottom(border = big_b, part = "all") %>% 
+    hline_top(border = big_b, part = "all" ) %>%
+    font(part = "all",fontname = "Times") %>% 
+    bold(part = "header")
+}
+
+#funkcja do wyliczania sredniej
+avgFunction <- function(data, teams, teamCol, homeORaway) {
+  
+  avgScore <- list()
+  for(j in 1:length(teams))
+  {
+    suma <- 0
+    #Ile poszczegolna druzyna srednio zdobywa //teamCol wskazuje czego srednia bedzie wyliczana
+    avgHT <- c(0)
+    
+    if(homeORaway == "home"){
+      htGoals <- data[which(data$HomeTeam == teams[j]),teamCol]
+    }
+    
+    if(homeORaway == "away"){
+      htGoals <- data[which(data$AwayTeam == teams[j]),teamCol]
+    }
+    
+    for(i in 2:(length(htGoals) + 1))
+    {
+      suma <- suma + htGoals[i-1]
+      avgHT[i]<- suma/length(avgHT)
+    }
+    
+    avgScore[[teams[j]]] <- avgHT[-length(avgHT)]
+  }
+  
+  return(avgScore)
+}
+
+#Wybranie interesujących statystyk // srednia, odchylenie, mediana, wartosc minimalna i maksymalna
+basic_stats <- function(frame) {
+  describe_frame <- data.frame()
+  frame <- cbind(frame, group = rep(1,nrow(frame)))
+  for (i in 1:(ncol(frame) - 1)) {
+    describe <- describeBy(frame[,i], frame$group)
+    describe <- t(data.frame(unlist(describe[[1]])))
+    describe <- round(describe[,c(3,4,5,8,9)],2)
+    describe <- cbind(variable = colnames(frame)[i],t(describe))
+    
+    describe_frame <- rbind(describe_frame,describe)
+  }
+  return(describe_frame)
+}
+
+#Podstawowe statystyki/ mean i median
+basic_stats_md <- function(frame) {
+  describe_frame <- data.frame()
+  frame <- cbind(frame, group = rep(1,nrow(frame)))
+  for (i in 1:(ncol(frame) - 1)) {
+    describe <- describeBy(frame[,i], frame$group)
+    describe <- t(data.frame(unlist(describe[[1]])))
+    describe <- round(describe[,c(3,4,5)],2)
+    describe <- cbind(variable = colnames(frame)[i],t(describe))
+    
+    describe_frame <- rbind(describe_frame,describe)
+  }
+  return(describe_frame)
+}
+
+#Dobor optymalnych parametrow
+hyperTuning <- function(data, target, method, params, resample_method = "CV", iters = 5L, predict_type = "prob", measures) {
+  #Algorytm optymalizacji
+  ctrl = makeTuneControlGrid()
+  
+  #Cross validation
+  desc = makeResampleDesc(resample_method, iters = iters)
+  
+  #Utworzenie zadania klasyfikujacego
+  task <- makeClassifTask(data=data, target=target)
+  
+  #Utworzenie modelu
+  model <- makeLearner(paste0('classif.',method), predict.type=predict_type)
+  
+  #Tuning
+  tuneparams <- tuneParams(learner=model, 
+                   resampling=desc, 
+                   measures=measures, 
+                   par.set=params, 
+                   control=ctrl, 
+                   task=task, 
+                   show.info = TRUE)
+  
+  #Optymalne parametry
+  optimal_params <- setHyperPars(model, par.vals = tuneparams$x)
+  
+  return(list(optimal_params,task))
+}
+
+ensamble_model = function(predictions, method, weights = NULL) {
+  
+  ensamble_predict = predictions[[1]]
+                                 
+  if(method == 'averaging')
+    #Wyliczenie sredniej oraz przewidywanego wyniku
+    ensamble_prob = Reduce("+", lapply(predictions, function(x){x$data[,c(2,3)]})) / length(predictions)
+    ensamble_response = as.factor(ifelse(ensamble_prob[,1]>0.5,0,1))
+    
+    #Przypisanie wynikow do ensamble_predict
+    ensamble_predict$data[,c(2,3)] = ensamble_prob
+    ensamble_predict$data[,4] = ensamble_response
+    
+    
+  return(ensamble_predict)
+  
+}
+
+```
+
+## 2. Dane
+Dane w większości zostały pobrane ze strony http://www.football-data.co.uk/scotlandm.php i dotyczą sezonu 2017/2018 oraz część została zdobyta przy pomocy webscrappingu. W podstawowej formie nie nadawały się do tworzenia na ich podstawie modeli, w związku z czym zostały poddane obróbce, która została zaprezentowana poniżej. Ponadto ze zmiennych zostały usunięte zmienne dotyczące kursów bukmacherskich, aby badanie opierało się tylko na statystykach piłkarskich. W zbiorze danych nie występują brakujące obserwacje.
+
+### 2.1 Webscrapping
+W celu zwiększenia liczby zmiennych ze strony https://www.fifaindex.com/pl/teams/fifa18_278/?league=50&order=desc zostały wydobyte informacje dotyczące średniej oceny ogólnej każdego zespołu występujującego w Szkockiej Premier League w sezonie 2017/2018. Nazwy zespołów zostały dostosowane do tych znajdujących się w sciągniętym pliku z pozostałymi zmiennymi. Pomimo, że są to tylko liczby w grze to jednak są stworzone przez ekspertów i przyczyniają się do poprawy jakości modeli.
+
+```{r pressure}
+####Przygotowanie danych
+data <- read.csv("ScotPrem.csv", dec = ",", sep = ";")
+
+#Czy domownicy strzela
+homeScore <- data$FTHomeGoals
+
+#Stworzenie tabeli
+teams <- as.character(unlist(unique(data$HomeTeam)))
+
+#Adres url
+url <- 'https://www.fifaindex.com/pl/teams/fifa18_278/?league=50&order=desc'
+
+#Odczytywanie html
+webpage <- read_html(url)
+
+#Wybranie rankingow
+rating_data_html <- html_nodes(webpage,'td:nth-child(7) .rating')
+team_names_html <- html_nodes(webpage, 'td+ td .link-team')
+
+#Konwertowanie do tekstu
+rating_data <- html_text(rating_data_html)
+rating_data <- as.numeric(unlist(rating_data))
+
+team_names <- html_text(team_names_html)
+team_names <- gsub(' [A-z ]*', '' , team_names)
+team_names[2] <- "Rangers"
+team_names[8] <- "St Johnstone"
+team_names[7] <- "Ross County"
+team_names[4] <- "Hearts"
+
+#ovrl
+overall <- list()
+for( i in 1:length(team_names)){
+  overall[[team_names[i]]] <- rating_data[i]
+}
+```
+
+### 2.2 Podstawowa forma danych
+Jak już zostało wcześniej wspomniane zmienne dotyczące kursów bukmacherskich zostały usunięte, a dane po tym zabiegu prezentują się następująco:
+```{r graphics, echo = FALSE}
+####Przygotowanie danych
+kable(head(data[,-c(1,2)]), "html") %>% kable_styling("striped") %>% scroll_box(width = "100%")
+```
+W związku z dużą liczbą występujących podobnych zmiennych, różniących się tylko tym czy dotyczą drużyny domowej (Home) czy wyjazdowej (Away), opis został skrócony zawierając w nazwach niektórych zmiennych (Home/Away) co oznacza, że występuje taka zmienna dla drużyny gospodarzy oraz gości. Używane zmienne to:
+
+* <b>(Home/Away)Team</b> - Nazwa drużyny
+
+* <b>FT(Home/Away)Goals</b> - Liczba strzelonych goli w meczu
+
+* <b>FTRes</b> - Wynik meczu (H - wygrana drużyny domowej, D - remis, A - wygrana drużyny wyjazdowej)
+
+* <b>HT(Home/Away)Goals</b> - Liczba strzelonych bramek do połowy meczu
+
+* <b>HalfTimeRes</b> - Wynik meczu do połowy (H - wygrana drużyny domowej, D - remis, A - wygrana drużyny wyjazdowej)
+
+* <b>Referee</b> - Sędzia w meczu
+
+* <b>(Home/Away)Shots</b> - Liczba oddanych strzałów w meczu
+
+* <b>(Home/Away)ShotsTarget</b> - Liczba oddanych celnych strzałów w meczu
+
+* <b>(Home/Away)Fouls</b> - Liczba popełnionych fauli w meczu
+
+* <b>(Home/Away)Corners</b> - Liczba rzutów rożnych w meczu
+
+* <b>(Home/Away)Yellow</b> - Liczba otrzymanych żółtych kartek w meczu
+
+* <b>(Home/Away)Red</b> - Liczba otrzymanych czerwonych kartek w meczu
+
+### 2.3 Przygotowywanie nowych zmiennych
+Niestety większość zmiennych nie nadaje się do konstruowania modelu przewidującego czy gospodarz odniesie zwycięstwo, jednak mogą one posłużyć do stworzenia nowych  i użytecznych. Na początku zostały odrzucone zmienne, które mają znikomy wpływ na to czy gospodarz odniesie zwycięstwo, takie jak: <b>HT(Home/Away)Goals</b>, <b>HalfTimeRes</b>, <b>Referee</b>, <b>(Home/Away)Yellow</b>, <b>(Home/Away)Red</b>. A na podstawie pozostałych zmiennych zostały stworzone nowe, tabela danych po obróbce prezentuje się następująco:
+```{r}
+##Wyliczanie ile punktów miały drużyny przystępując do meczów
+
+#Łączna ilość rożnych w meczu
+corners <- data$HomeCorners + data$AwayCorners
+#Tworzenie tabeli
+homeOrAway <- list()
+points <- list()
+for(i in 1:length(teams)) {
+  teams_data <- data[which(data$HomeTeam == teams[i] | data$AwayTeam == teams[i]),]
+  match_points <- 0
+  sumcia <- 0
+  homeOrAway_vec <- vector()
+  for(j in 1:nrow(teams_data)) {
+    results <- teams_data[j,c(3,4,7)]
+    
+    if(results$HomeTeam == teams[i] & results$FTresults == "H") {
+      sumcia <- match_points[length(match_points)] + 3
+      match_points[j] <- sumcia
+      homeOrAway_vec[j] <- "H"
+    }
+    if(results$HomeTeam == teams[i] & results$FTresults == "D") {
+      sumcia <- match_points[length(match_points)] + 1
+      match_points[j] <- sumcia
+      homeOrAway_vec[j] <- "H"
+    }
+    if(results$HomeTeam == teams[i] & results$FTresults == "A") {
+      sumcia <- match_points[length(match_points)] + 0
+      match_points[j] <- sumcia
+      homeOrAway_vec[j] <- "H"
+    }
+    if(results$AwayTeam == teams[i] & results$FTresults == "A") {
+      sumcia <- match_points[length(match_points)] + 3
+      match_points[j] <- sumcia
+      homeOrAway_vec[j] <- "A"
+    }
+    if(results$AwayTeam == teams[i] & results$FTresults == "D") {
+      sumcia <- match_points[length(match_points)] + 1
+      match_points[j] <- sumcia
+      homeOrAway_vec[j] <- "A"
+    }
+    if(results$AwayTeam == teams[i] & results$FTresults == "H") {
+      sumcia <- match_points[length(match_points)] + 0
+      match_points[j] <- sumcia
+      homeOrAway_vec[j] <- "A"
+    }
+  }
+  points[[teams[i]]] <- c(0,match_points[-length(match_points)])
+  homeOrAway[[teams[i]]] <- homeOrAway_vec
+}
+
+#match_resultsult meczu do postaci 0-1
+match_results <- as.character(unlist(data$FTresults))
+
+match_results[match_results == "H"] <- 1
+match_results[match_results != 1] <- 0
+
+match_results <- as.numeric(match_results)
+
+data$FTresults <- match_results
+
+#Overall
+data <- data.frame(data, HomeOverall = rep(1,nrow(data)),AwayOverall = rep(2,nrow(data)))
+
+for(i in 1:length(teams)) {
+  data[which(data$HomeTeam==teams[i]),24] <- overall[[teams[i]]]
+  data[which(data$AwayTeam==teams[i]),25] <- overall[[teams[i]]]
+}
+
+#Wyliczanie srednich dla zmiennych
+avgFTHGoals <- avgFunction(data, teams, 5, "home")
+avgHomeLost <- avgFunction(data, teams, 6, "home")
+avgFTAGoals <- avgFunction(data, teams, 6, "away")
+avgAwayLost <- avgFunction(data, teams, 5, "away")
+avgHTShots <- avgFunction(data, teams, 12, "home")
+avgATShots <- avgFunction(data, teams, 13, "away")
+avgHTTarget <- avgFunction(data, teams, 14, "home")
+avgATTarget <- avgFunction(data, teams, 15, "away")
+avgHomeFouls <- avgFunction(data, teams, 16, "home")
+avgAwayFouls <- avgFunction(data, teams, 17, "away")
+avgHTCorners <- avgFunction(data, teams, 18, "home")
+avgATCorners <- avgFunction(data, teams, 19, "away")
+avgHomeYellow <- avgFunction(data, teams, 20, "home")
+avgAwayYellow <- avgFunction(data, teams, 21, "away")
+avgHomeRed <- avgFunction(data, teams, 22, "home")
+avgAwayRed <- avgFunction(data, teams, 23, "away")
+
+
+#Przypisanie nowych zmiennych
+for(i in 1:length(teams)){
+  #Goals
+  data[which(data$HomeTeam == teams[i]),5] <- avgFTHGoals[[teams[i]]]
+  data[which(data$HomeTeam == teams[i]),8] <- avgHomeLost[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),6] <- avgFTAGoals[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),9] <- avgAwayLost[[teams[i]]]
+  
+  #Shots
+  data[which(data$HomeTeam == teams[i]),12] <- avgHTShots[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),13] <- avgATShots[[teams[i]]]
+  data[which(data$HomeTeam == teams[i]),14] <- avgHTTarget[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),15] <- avgATTarget[[teams[i]]]
+  
+  #Fouls
+  data[which(data$HomeTeam == teams[i]),16] <- avgHomeFouls[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),17] <- avgAwayFouls[[teams[i]]]
+  
+  #Corners
+  data[which(data$HomeTeam == teams[i]),18] <- avgHTCorners[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),19] <- avgATCorners[[teams[i]]]
+  
+  #Cards
+  data[which(data$HomeTeam == teams[i]),20] <- avgHomeYellow[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),21] <- avgAwayYellow[[teams[i]]]
+  data[which(data$HomeTeam == teams[i]),22] <- avgHomeRed[[teams[i]]]
+  data[which(data$AwayTeam == teams[i]),23] <- avgAwayRed[[teams[i]]]
+}
+
+#Dodawanie liczby punktow, ktore mialy zespoly przystepujac do meczu
+data <- cbind(data, HomePoint = rep(1, nrow(data)), AwayPoint = rep(2,nrow(data)))
+for(i in 1:length(teams)) {
+  data[which(data$HomeTeam==teams[i]),26] <- points[[teams[i]]][which(homeOrAway[[teams[i]]] == "H")]
+  data[which(data$AwayTeam==teams[i]),27] <- points[[teams[i]]][which(homeOrAway[[teams[i]]] == "A")]
+}
+
+####Tworzenie osatecznego data frame
+data <- data[-c(1:12),]
+data <- data[,c(3,4,5,6,7,8,9,12,13,14,15,16,17,18,19,20,21,24,25,26,27)]
+colnames(data) <- c("HomeTeam", "AwayTeam", "HomeGoals","AwayGoals", "Result", "HomeLost", "AwayLost","HomeShots","AwayShots",
+                    "HomeTarget", "AwayTarget", "HomeFouls", "AwayFouls", "HomeCorners", "AwayCorners","HomeYellow", "AwayYellow",
+                    "HomeOverall", "AwayOverall","HomePoints", "AwayPoints")
+
+data <- data.frame(HomeTeam = data$HomeTeam, AwayTeam = data$AwayTeam, Result = data$Result,HomeScore = homeScore[-c(1:12)], AVGGoals = data$HomeGoals - data$AwayGoals, AVGLost = data$HomeLost - data$AwayLost,
+                   AVGShots = data$HomeShots - data$AwayShots, AVGTarget = data$HomeTarget - data$AwayTarget,
+                   AVGCorners = data$HomeCorners - data$AwayCorners, AVGFouls = data$HomeFouls - data$AwayFouls,
+                   Overall = (data$HomeOverall/data$AwayOverall) - 1, PointsDiff = data$HomePoints-data$AwayPoints)
+
+
+data[which(data$HomeScore >0 ),4] <- 1
+data <- data[,-4]
+
+kable(head(data), "html") %>% kable_styling("striped")
+
+data$Corners <- corners[13:228]
+```
+
+Dla osób interesujących się piłką nożną jasnym jest, że często dochodzi do sytuacji, że dana drużyna inaczej radzi sobie na wyjeĹşdzie, a inaczej na swoim stadionie. W związku z czym przygotowane zmienne opierają się na średnich statystykach jakie dana drużyna posiada na wyjeĹşdzie lub jako gospodarz, w zależności od tego gdzie gra mecz. Jeśli drużyna "A" gra jako gospodarz i "B" jako gość, to do wyliczenia zmiennych były brane odpowiednio średnie statystyki drużyny "A" w roli gospodarza oraz średnie statystyki drużyny "B" w roli drużyny wyjazdowej. Większość zmiennych opiera się na różnicy pomiędzy średnimi statystykami grających drużyn, w przypadku kiedy wartość jest większa od 0 oznacza to, że drużyna gospodarzy średnio więcej doświadcza pewnego zdarzenia w roli drużyny domowej, aniżeli drużyna wyjazdowa w roli gościa. Wyjątkami są zmienne: Overall - ile razy większą ocenę ogólną posiada drużyna gospodarza; PointsDiff - ile więcej punktów posiada gospodarz niż gość w tym meczu. Ogólny opis:
+
+* <b>(Home/Away)Team</b> - Nazwa drużyny
+
+* <b>Result</b> - Wynik meczu (1 - wygrana gospodarzy, 0 - przegrana gospodarzy lub remis)
+
+* <b>AVGGoals</b> - Różnica w średniej liczbie strzelonych dotychczas bramek na mecz przez obie drużyny. Jeśli gospodarz będzie strzelał średnio więcej bramek na mecz w roli gospodarza niż gość w roli gościa, to szansa na wygranie meczu przez drużyne domową powinna wzrosnąć, w przeciwnym przypadku zmaleć
+
+* <b>AVGLost</b> - Różnica w średniej liczbie traconych dotychczas bramek na mecz przez obie drużyny. Jeśli gospodarz będzie tracił średnio więcej bramek na mecz w roli gospodarza niż gość w roli gościa, to szansa na wygranie meczu przez drużyne domową powinna zmaleć, w przeciwnym przypadku wzrosnąć
+
+* <b>AVGShots</b> - Różnica w średniej liczbie oddanych dotychczas strzałów na mecz przez obie drużyny. Jeśli gospodarz będzie oddawał średnio więcej strzałów na mecz w roli gospodarza niż gość w roli gościa, to szansa na strzelenie bramki przez gospodarza powinna wzrosnąć, a co za tym idzie, szansa na wygranie meczu przez drużyne domową również powinno wzrosnąć, w przeciwnym przypadku zmaleć.
+
+* <b>AVGTarget</b> - Różnica w średniej liczbie oddanych dotychczas celnych strzałów na mecz przez obie drużyny. Jeśli gospodarz będzie oddawał średnio więcej celnych strzałów na mecz w roli gospodarza niż gość w roli gościa, to szansa na strzelenie bramki przez gospodarza powinna wzrosnąć, a co za tym idzie, szansa na wygranie meczu przez drużyne domową również powinno wzrosnąć, w przeciwnym przypadku zmaleć.
+
+* <b>AVGCorners</b> - Różnica w średniej liczbie posiadanych dotychczas rzutów rożnych na mecz przez obie drużyny. Jeśli gospodarz będzie posiadał średnio więcej rzutów rożnych na mecz w roli gospodarza niż gość w roli gościa, to szansa na strzelenie bramki przez gospodarza powinna wzrosnąć w związku z większą ilością sytuacji podbramkowych, a co za tym idzie, szansa na wygranie meczu przez drużyne domową również powinna wzrosnąć, w przeciwnym przypadku zmaleć.
+
+* <b>AVGFouls</b> - Różnica w średniej liczbie popełnianych dotychczas fauli na mecz przez obie drużyny Jeśli gospodarz będzie popełniał średnio więcej fauli na mecz w roli gospodarza niż gość w roli gościa, to szansa na strzelenie bramki przez gospodarza powinna zmaleć w związku z większą ilością sytuacji, w których może on stracić zawodnika przez wykartkowanie lub rośnie szansa na to, że drużyna przeciwna będzie mogła oddać strzał bezpośredni z wolnego, a co za tym idzie, szansa na wygranie meczu przez drużyne domową również powinna zmaleć, w przeciwnym przypadku wzrosnąć.
+
+* <b>Overall</b> - Ile razy więcej oceny ogólnej posiada drużyna przystępująca do meczu w roli gospodarza niż przeciwna. Im lepszy będzie zespół występujący w roli gospodarza tym większą powinien posiadać szansę na wygranie meczu.
+
+* <b>PointsDiff</b> - Ile więcej punktów posiada gospodarz niż gość w tym meczu. Im lepiej będzie radzić sobie drużyna domowa w roli gospodarza niż wyjazdowa w gościa tym większą szanse na odniesienie zwycięstwa powinna mieć.
+
+## 3. Eksploracja zmiennych
+
+Eksploracja zmiennych została rozpoczęta od sprawdzenia liczności dla meczów, w których wygrała drużyna gospodarzy i pozostałych:
+```{r, echo = FALSE, message=FALSE, warning=FALSE,fig.align = 'center',out.extra='angle=90', fig.height=4}
+data %>% 
+ggplot(aes(x=as.factor(Result), fill = as.factor(Result)))+
+        geom_histogram(stat = "count")+
+        labs(x = "Czy gospodarz wygra mecz")+
+        geom_label(stat='count',aes(label=..count..)) +
+        labs(fill = "Result")
+
+```
+
+W 40% meczów zwycięstwo odniosła drużyna grająca u siebie, co nie jest najlepszym wynikiem, jednak nadal pozwala na osiągnięcie ciekawych zysków przy obstawianiu na gospodarzy w zakładach bukmacherskich jeśli wyniki modelu będą na przyzwoitym poziomie.<br/>
+
+###3.1 Podstawowe statystyki
+Podstawowe statystyki dotyczące zmiennych wyglądają następująco:
+
+```{r, echo = FALSE}
+statistics <- basic_stats(data[,-c(1,2,3)])
+frame_func(statistics)
+```
+
+Na podstawie tabeli można zaobserwować, że dla wszystkich zmiennych średnia oraz mediana nie przekraczają 1, a w praktycznie każdym, nawet 0.5. Może to świadczyć o sporym podobiećstwie w statystykach grających drużyn, a co za tym idzie, może wystąpić problem z predykcją czy w danym meczu wygra gospodarz lub o tym, że rozkłady w statystykach są rozłożone mniej więcej symetrycznie względem 0. Jednak w przypadku takich zmiennych jak: AVGShots, AVGTarget, AVGCorners, AVGFouls, PointsDiff odchylenie standardowe jest dosyć spore co może się przełożyć na dokładniejsze rozróżnienie czy to gospodarz wyjdzie zwycięsko z tego meczu.
+
+###3.2 Wykresy pudełkowe
+Koljenym etapem jest przyjrzenie się czy różnią się mediany w poszczególnych zmiennych oraz kwartyle i odchylenia w zależności od rezultatu:
+```{r, echo = FALSE, fig.align = 'center',out.extra='angle=90', fig.height=8}
+df.m <- melt(data[,-c(1,2)], id.var = "Result")
+df.m[,1] <- as.factor(df.m[,1])
+p <- ggplot(data = df.m, aes(x=variable, y=value)) + 
+             geom_boxplot(aes(fill=Result))
+p + facet_wrap( ~ variable, scales="free")
+```
+
+Występują obserwacje odstające jednak ze względu na to, aby nie tracić zmiennych oraz ze względu na to, że nie są w większości drastycznie odstające w tym przypadku zostaną zachowane. Jak można zauważyć na wykresach największe różnice występują przy zmiennych: AVGShots oraz Overall, w związku z czym powinny determinować w sposób jeden z lepszych przy tym zbiorze danych. Natomiast pudełka z wąsami na wykresach zmiennych takich jak: AVGGoals i AVGFouls są najbardziej podobne do siebie w związku z czym powinny determinować w sposób jeden z gorszych dla takich zmiennych.
+
+###3.3 Macierz korelacji
+Ostatecznie przyjrzymy się macierzy korelacji:
+```{r}
+wspKor <- cor(data[,-c(1,2)])
+
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+corrplot(wspKor, method = "color", col = col(200),
+         type = "upper", order = "hclust", number.cex = .7,
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col = "black", tl.srt = 90, # Text label color and rotation
+         # Combine with significance
+          sig.level = 0.01, insig = "blank", 
+         # hide correlation coefficient on the principal diagonal
+         diag = FALSE)
+
+```
+
+Jak można zauważyć korelacje nie są satysfakcjonujące, ze zmienną Result, pozostałe zmienne mają umiarkowaną korelacje, natomiast pomiędzy zmiennymi objaśniającymi jest ona w wielu przypadkach duża. Występują trzy korelacje powyżej 0.7 co może wpłynąć na metody modelowania, jednak i w tym przypadku żadna nie zostanie usunięta, ponieważ te zmienne objaśniane pomiędzy którymi jest największa korelacja posiadają również stosunkowo dużą korelacje ze zmienną objaśnianą.
+
+## 4. Zbiór testowy i treningowy
+Koniecznym i jednym z kluczowych elementów Machine Learningu jest podział danych na zbiór testowy i treningowy. W tym przypadku został podzielony w stosunku 0.75:0.25 dla treningowy:testowy, natomiast ziarno ustawione na wartość 123. Podział danych został wykonany przy pomocy wylosowania 75% losowych wierszy z meczami dla zbioru treningowego oraz przypisania pozostałych do testowego.
+```{r, echo = FALSE}
+####Badanie
+set.seed(123)
+split = sample.split(data$Result, SplitRatio = 0.75)
+train = subset(data, split == TRUE)
+test = subset(data, split == FALSE)
+
+X_train = train[,-c(1:3)]
+y_train = train$Result
+X_test = test[,-c(1:3)]
+y_test = test$Result
+
+y_train = factor(y_train, levels = c(0, 1))
+y_test = factor(y_test, levels = c(0, 1))
+
+#Skalowanie zmiennych
+X_train_std = scale(X_train)
+X_test_std = scale(X_test)
+
+#Polaczenie zbiorow do makeClassifTask
+training_set_std = data.frame(X_train_std, Result = y_train)
+test_set_std = data.frame(X_test_std, Result = y_test)
+
+training_set = data.frame(X_train, Result = y_train)
+test_set = data.frame(X_test, Result = y_test)
+```
+
+###4.1 Porównanie zbioru treningowego oraz testowego
+
+Jako pierwsze zostaną porównane liczności w zbiorze teningowym oraz testowym w zależności od rezultatu meczu
+```{r, echo = FALSE, message=FALSE, warning=FALSE,fig.align = 'center',out.extra='angle=90'}
+set.seed(123)
+plot1 <- train %>% 
+            ggplot(aes(x=as.factor(Result), fill = as.factor(Result)))+
+              geom_histogram(stat = "count")+
+              labs(x = "Czy gospodarz wygra mecz - zbiór treningowy")+
+              geom_label(stat='count',aes(label=..count..)) +
+              theme(legend.title = element_blank())
+plot2 <- test %>% 
+            ggplot(aes(x=as.factor(Result), fill = as.factor(Result)))+
+              geom_histogram(stat = "count")+
+              labs(x = "Czy gospodarz wygra mecz - zbiór testowy")+
+              geom_label(stat='count',aes(label=..count..)) +
+              theme(legend.title = element_blank())
+
+grid.arrange(plot1, plot2)
+```
+
+Stosunek meczów wygranych przez gospodarza do pozostałych jest podobny w zbiorze testowym oraz treningowym i wynosi około 2/3.<br/>
+Ponadto w przypadku weryfikacji czy podział danych jest poprawny warto spojrzeć na podstawowe satystyki dla obu zbiorów danych:
+```{r}
+set.seed(123)
+train_stat <- basic_stats_md(train[,-c(1,2)])
+test_stat <- basic_stats_md(test[,-c(1,2)])
+
+z <- cbind(train_stat,test_stat[,-1])
+colnames(z) <- c("Variable", "Mean - train", "Sd - train", "Median - train", "Mean - test", "Sd - test", "Median - test")
+frame_func(z)
+
+```
+
+Wszystkie zmienne mają podobne statystyki dla zbioru testowego oraz treningowego, co pozwala nam przejść do dalszego etapu modelowania. W przypadku niektórych z modeli uczenia maszynowego dane zostaną zestandaryzowane, ze względu na to, że modele te nie radzą sobię w przypadku, gdy wartości przyjmowane przez zmienne znajdują się na różnych skalach.
+
+##5. Badanie
+Jednym z kluczowych aspektów tworzenia modelu uczenia maszynowego jest oszacowanie jego skuteczności wobec nieznanych danych, może zdażyć się, że model będzie niewystarczająco dopasowany z powodu zbyt małej złożonośi lub przetrenowany z powodu zbyt wysokiego stopnia skomplikowania. W celu określenia kompromisu pomiędzy obciążeniem, a wariancją została zastosowana k-krotna kroswalidacja.
+
+Modele zostaną skonstruowane przy pomocy metod: KNN, Naiwny Klasyfikator Bayesa, Random Forest oraz Drzewa Decyzyjnego. Ze względu na to, że w zakładach bukmacherskich wynik: X2 - remis lub wygrana drużyny gości, ma zazwyczaj mniejszy kurs niż 1 - wygrana drużyny gospodarzy, od wyników można oczekiwać, aby precyzja była jak największa, czyli jak najwięcej wygranych meczów przez drużyne gospodarzy zostało zaklasyfikowanych poprawnie. Ze względu na to, że dla pierwszych 12 kolejek zmienne przyjmują wartości 0 zostały one usunięte. Dla każdej z metod zostało przeprowadzone dostrajanie hiperparametrów z użyciem biblioteki mlr, gdzie miarami na podtawie, których był wybierany optymalny zestaw hiperparametrów są: odsetek prawdziwie dodatnich, obszar pod krzywą, precyzja, średni błąd złego przydziału, odsetek prawdziwie fałszywych, oraz odchylenie odsetku prawdziwie dodatnich.
+
+###5.1 Metoda KNN
+Przed przystąpieniem do wdrażania metody KNN najważniejsze to dowiedzieć się jaką liczbe sąsiadów należy wziąć pod uwagę, ponadto do parametrów, które były dostrajane zalicza się wartość jaką przyjmuje odległość Minkowskiego oraz jakie jądro algorytmu (kernel) zostanie użyte. Poniżej zostały zaprezentowane macierze dopasowaĹ„ dla przewidywaĹ„ na danych treningowych oraz testowych.
+
+```{r, include = FALSE, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Sprawdzenie hiperparametrow
+#getParamSet("classif.kknn")
+
+#Przydzielanie wartosci jakie moga przyjmowac parametry
+knn_param <- makeParamSet(makeDiscreteParam("k", values=seq(3,6,1)),
+                         makeDiscreteParam("distance", values=seq(1,3,1)),
+                         makeDiscreteParam("kernel",
+                                                 values = list("rectangular", "triangular", "epanechnikov",
+                                                               "biweight","triweight", "cos", "inv", "gaussian", "optimal"))
+                        )
+
+#Wybranie miar na bazie jakich bedzie wybierany optymalny zestaw parametrow
+measures = list(tpr, mlr::auc,ppv, mmce, tnr, setAggregation(tpr, test.sd))
+
+#Dobor optymalnych parametrow
+knn_optimal = hyperTuning(data = training_set_std, target = "Result", method = "kknn", params = knn_param,
+                             resample_method = "CV", iters = 5L, predict_type = "prob", measures = measures)
+
+#Uczenie modelu
+set.seed(123)
+knn_train <- mlr::train(learner=knn_optimal[[1]], task=knn_optimal[[2]]) 
+getLearnerModel(knn_train)
+
+```
+
+####Treningowy
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze treningowym
+set.seed(123) 
+knn_train_predict <- predict(knn_train, newdata = training_set_std)
+
+#Conf matrix
+conf_matrix = knn_train_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru treningowego
+performance(knn_train_predict, measures = list(tpr,mlr::auc,mmce,tnr, ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative","Precision")) %>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>%
+  kable_styling(position = "center", full_width = F)
+```
+
+Z wyników dla zbioru treningowego możemy zobaczyć, że model nie pomylił się ani razu, co najprawdopodobniej świadczy o przetrenowaniu i  w przypadku, gdy zetknie się z danymi, na których nie był uczony ten wynik będzie już gorszy.
+
+####Testowy
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze testowym
+set.seed(123) 
+knn_predict <- predict(knn_train, newdata = test_set_std)
+
+#Conf matrix
+conf_matrix = knn_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru testowego
+performance(knn_predict, measures = list(tpr,mlr::auc,mmce,tnr, ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative","Precision")) %>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>%
+  kable_styling(position = "center", full_width = F)
+```
+
+Tak jak można było przypuszczać wyniki dla danych, z którymi model jeszcze nie obcował są znacznie gorsze. Niestety jesli gracz przy pomocy tego modelu chciałby zarabiać obstawiając, że gospodarz wygra mecz to obstawiając na kuponie tylko po jednym meczu zaledwie w 50% przypadków odniósłby sukces. W przypadku obstawiania remisu lub wygranej drużyny gości rownież po jednym meczu mógłby liczyć na wygraną w 72% przypadków, jednak kursy na takie zdarzenia byłyby słabe, więc raczej nie można mówić, że przy pomocy tego modelu można zarobić na bukmacherce.
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Jak zachowają się miary w zaleznosci od punktu granicznego
+knn_threshold <- generateThreshVsPerfData(knn_predict, measures = list(tpr,ppv, mmce,tnr)) %>%
+  plotThreshVsPerf() + geom_point()
+knn_threshold
+```
+
+Z powyższych wykresów można zauważyć, że średni błąd złego przydziału jest najmniejszy, gdy rozdzielanie na klasy 0-1 rezultatu jest ustawione w okolicach 50%. W celu maksymalizacji zysku powinniśmy się zastanowić nad zwiększeniem progu, ze względu na co więcej rezultatów byłoby oznaczanych jako 0, jednak wtedy możnaby rozważyć granie na wygraną gospodarzy w meczu przy pomocy tego modelu.
+Po zweryfikowaniu skuteczności modelu na zbiorze treningowym z użyciem domyślnego jądra systemu jakim jest "optimal", model nie osiągał już 100% skuteczności, jednak rozbieżności w skuteczności cały czas wskazywały na przetrenowanie modelu.
+
+###5.2 Metoda Naiwny Klasyfikator Bayesa
+Przy stosowaniu Naiwnego Klasyfikatora Bayesa występuje znacznie mniejsza liczba parametrów, które mogą zostać zoptymalizowane. Stosując pakiet mlr można przeprowadzić dopasowanie zaledwie dla wygładzania Laplace'a, dla którego został zastosowany przedział od 0 do 10 dla liczb całkowitych.
+
+```{r, include = FALSE, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Sprawdzenie hiperparametrow
+#getParamSet("classif.naiveBayes")
+
+#Przydzielanie wartosci jakie moga przyjmowac parametry
+bayes_param <- makeParamSet(makeDiscreteParam("laplace", values=seq(0,10,1))
+                        )
+
+#Wybranie miar na bazie jakich bedzie wybierany optymalny zestaw parametrow
+measures = list(tpr, mlr::auc,ppv, mmce, tnr, setAggregation(tpr, test.sd))
+
+#Doboe optymalnych parametrow
+bayes_optimal = hyperTuning(data = training_set_std, target = "Result", method = "naiveBayes", params = bayes_param,
+                             resample_method = "CV", iters = 5L, predict_type = "prob", measures = measures)
+
+#Uczenie modelu
+set.seed(123)
+bayes_train <- mlr::train(learner=bayes_optimal[[1]], task=bayes_optimal[[2]]) 
+getLearnerModel(bayes_train)
+
+```
+
+####Treningowy
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze treningowym
+set.seed(123) 
+bayes_train_predict <- predict(bayes_train, newdata = training_set_std)
+
+#Conf matrix
+conf_matrix = bayes_train_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru treningowego
+performance(bayes_train_predict, measures = list(tpr,mlr::auc,mmce,tnr, ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative","Precision"))%>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>%
+  kable_styling(position = "center", full_width = F)
+```
+
+Jak możemy zauważyć powyżej w tym przypadku trafność dla zbioru treningowego jest znacznie mniejsza niż dla modelu KNN, jednak nie możemy na podstawie tego wyciągać wniosków. Chociaż przewidywane wyniki odnoszą się do meczów, na których model był trenowany to wyniki nie wydają się być satysfakcjonujące.
+
+####Testowy
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze testowym
+set.seed(123) 
+bayes_predict <- predict(bayes_train, newdata = test_set_std)
+
+#Conf matrix
+conf_matrix = bayes_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru testowego
+performance(bayes_predict, measures = list(tpr,mlr::auc,mmce,tnr, ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative","Precision"))%>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>%
+  kable_styling(position = "center", full_width = F)
+```
+
+Dla zbioru testowego wyniki są słabsze niż w przypadku modelu KNN. Chociaż liczba poprawnie sklasyfikowanych wygranych gospodarzy jest taka sama jak w poprzednim modelu to przy klasyfikacji remisów lub wygranych gości model ten spisuje się gorzej.
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Jak zachowają się miary w zaleznosci od punktu granicznego
+bayes_threshold <- generateThreshVsPerfData(bayes_predict, measures = list(tpr,ppv, mmce,tnr)) %>%
+  plotThreshVsPerf() + geom_point()
+bayes_threshold
+```
+
+Tym razem średni błąd złego przydziału osiąga najmniejsze wartości w okolicach 75%, 10% oraz 0% co świadczy o tym jak Ĺşle spisuje się dla tego problemu ten model.
+
+###5.3 Drzewo Decyzyjne
+Dla Drzewa Decyzyjneo już większa liczba hiperparametrów została zoptymalizowana. Do dopasowanych parametrów zaliczają się: minimalna liczba obserwacji, które muszą znaleĹşć się w węĹşle, aby można było dokonać podziału; minimalna liczba obserwacji w dowolnym węĹşle; złożoność; maksymalna głębokość dowolnego węzła.
+
+```{r, include = FALSE, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Sprawdzenie hiperparametrow
+#getParamSet("classif.rpart")
+
+#Przydzielanie wartosci jakie moga przyjmowac parametry
+tree_param <- makeParamSet(makeDiscreteParam("minsplit", values=seq(5,10,1)),
+                         makeDiscreteParam("minbucket",values=seq(round(5/3,0), round(10/3,0), 1)),
+                         makeNumericParam("cp", lower = 0.001, upper = 0.05),
+                         makeDiscreteParam("maxcompete", values=6),
+                         makeDiscreteParam("usesurrogate", values=0),
+                         makeDiscreteParam("maxdepth", values=c(10,20, 30))
+                        )
+
+#Wybranie miar na bazie jakich bedzie wybierany optymalny zestaw parametrow
+measures = list(tpr, mlr::auc, ppv, mmce, tnr, setAggregation(tpr, test.sd))
+
+#Doboe optymalnych parametrow
+tree_optimal = hyperTuning(data = training_set, target = "Result", method = "rpart", params = tree_param,
+                             resample_method = "CV", iters = 5L, predict_type = "prob", measures = measures)
+
+#Uczenie modelu
+set.seed(123)
+tree_train <- mlr::train(learner=tree_optimal[[1]], task=tree_optimal[[2]]) 
+getLearnerModel(tree_train)
+
+#Wykres
+rpart.plot(tree_train$learner.model, roundint=FALSE, varlen=3, type = 3, clip.right.labs = FALSE, yesno = 2)
+
+#rpart.rules(tree_train$learner.model, roundint = FALSE)
+```
+
+####Treningowy
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze treningowym
+set.seed(123) 
+tree_train_predict <- predict(tree_train, newdata = training_set)
+
+#Conf matrix
+conf_matrix = tree_train_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru treningowego
+performance(tree_train_predict, measures = list(tpr,mlr::auc,mmce,tnr,ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative", "Precision"))%>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>%
+  kable_styling(position = "center", full_width = F)
+```
+
+Dla zbioru treningowego model Drzewa Decyzyjnego poradził sobie znacznie lepiej jeśli chodzi o skuteczność niż Naiwny Klasyfikator Bayesa i chociaż ma wynik słabszy aniżeli KNN to można optymistycznie zapatrywać się na ewentualne praktyczne zastosowanie.
+
+####Testowy
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze testowym
+set.seed(123) 
+tree_predict <- predict(tree_train, newdata = test_set)
+
+#Conf matrix
+conf_matrix = tree_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru testowego
+performance(tree_predict, measures = list(tpr,mlr::auc,mmce,tnr,ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative", "Precision"))%>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>%
+  kable_styling(position = "center", full_width = F)
+```
+
+Dla zbioru testowego wyniki niestety nie są zadawalające, w stosunku do poprzednich modeli Drzewo Decyzyjne znacznie gorzej klasyfikuje remis lub przegraną gospodarzy, natomiast jeśli choci o poprawne rozpoznanie meczu, w którym zwycięstwo odniosą gospodarze to poprawił się zaledwie o jedno rozpoznanie.
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Jak zachowają się miary w zaleznosci od punktu granicznego
+tree_threshold <- generateThreshVsPerfData(tree_predict, measures = list(tpr,ppv, mmce,tnr)) %>%
+  plotThreshVsPerf() + geom_point()
+tree_threshold
+```
+
+Jak można zauważyć powyżej najmniejszą wartość średni błąd złego przydziału osiąga dla najmniejszych procentów, a więc tak jak w przypadku Naiwnego Klasyfiatora Bayesa można przypuszczać, że model nie sprawdza się zbyt dobrze przy tym problemie.
+
+###5.4 Random Forest
+
+Kolejnym z modeli jest Random Forest, w kórym następująco hiperparametry zostałe zoptymalizowane: liczba drzew; liczba zmiennych losowana przy podziale każdego węzła; minimalny rozmiar węzłów koĹ„cowych; czy należy oceniać istotność zmiennych?; czy pobieranie próbek powinno odbywać się z losowym rozstawieniem danych?; Czy należy obliczyć miarę ważności zmiennych?; Czy współczynnik odległości pomiędzy obserwacjami powinien zostać obliczonyny?
+
+```{r, include = FALSE, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Sprawdzenie hiperparametrow
+#getParamSet("classif.randomForest")
+
+#Przydzielanie wartosci jakie moga przyjmowac parametry
+random_param <- makeParamSet(makeDiscreteParam("ntree", values=seq(50,150,10)),
+                         makeDiscreteParam("mtry", values=seq(1,3,1)),
+                         makeDiscreteParam("nodesize", values=seq(1,5,1)),
+                         makeLogicalParam("replace"),
+                         makeLogicalParam("importance"),
+                         makeLogicalParam("localImp"),
+                         makeLogicalParam("proximity")
+                        )
+
+#Wybranie miar na bazie jakich bedzie wybierany optymalny zestaw parametrow
+measures = list(tpr, mlr::auc,ppv, mmce, tnr, setAggregation(tpr, test.sd))
+
+set.seed(123)
+#Doboe optymalnych parametrow
+random_optimal = hyperTuning(data = training_set, target = "Result", method = "randomForest", params = random_param,
+                             resample_method = "CV", iters = 5L, predict_type = "prob", measures = measures)
+
+#Uczenie modelu
+set.seed(123)
+random_train <- mlr::train(learner=random_optimal[[1]], task=random_optimal[[2]]) 
+getLearnerModel(random_train)
+
+```
+
+####Treningowy
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze treningowym
+set.seed(123) 
+random_train_predict <- predict(random_train, newdata = training_set)
+
+#Conf matrix
+conf_matrix = random_train_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru treningowego
+performance(random_train_predict, measures = list(tpr,mlr::auc,mmce,tnr,ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative", "Precision"))%>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>% 
+  kable_styling(position = "center", full_width = F)
+```
+
+Tak samo jak w przypadku KNN model Random Forest dla zbioru treningowego nie pomylił się ani razu, co najprawdopodobniej świadczy o przetrenowaniu modelu i w przypadku danych, z którymi styczności jeszcze on nie miał wyniki będą znacznie gorsze.
+
+####Testowy
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Przewidywanie na zbiorze testowym
+set.seed(123) 
+random_predict <- predict(random_train, newdata = test_set)
+
+#Conf matrix
+conf_matrix = random_predict %>% calculateROCMeasures() %>% .[1] %>% as.data.frame()
+colnames(conf_matrix) = c("0", "1")
+
+#Macierz dopasowaĹ„
+kable(conf_matrix, "html") %>% kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c("Przewidywanie" = 2, "Wyniki rzeczywiste" = 1))
+
+```
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Wyniki miar dla zbioru testowego
+performance(random_predict, measures = list(tpr,mlr::auc,mmce,tnr,ppv)) %>% 
+  as.data.frame(row.names = c("True Positive","Area Under Curve", "Mean Misclassification Error","True Negative", "Precision"))%>%
+  kable(digits = 2, format = 'html', col.names = "Result") %>% 
+  kable_styling(position = "center", full_width = F)
+```
+
+W przypadku danych testowych niestety tak samo jak poprzednie modele Random Forest nie spisuje się najlepiej. Chociaż w przypadku klasyfikacji wygranej gospodarzy robi to najskuteczniej na równi z Drzewem Decyzyjnym, to przewidywanie remisu lub zwycięstwa gości wychodzi mu słabiej niż modelowi KNN.
+
+```{r, echo = FALSE,fig.align = 'center',out.extra='angle=90'}
+#Jak zachowają się miary w zaleznosci od punktu granicznego
+random_threshold <- generateThreshVsPerfData(tree_predict, measures = list(tpr,ppv, mmce,tnr)) %>%
+  plotThreshVsPerf() + geom_point()
+random_threshold
+```
+
+Średni błąd złego przydziału również i dla tego modelu osiąga najmniejsze wartości dla punktu granicznego w okolicach 0% co znaczy, że klasyfikując wszystkie przypadki jako remis lub wygraną gości nasz model byłby skuteczniejszy aniżeli teraz.
+Po zweryfikowaniu skuteczności modelu na zbiorze treningowym dostrajając zaledwie liczbę drzew z jakich składa się model okazuje się, że i tak osiąga on 100% skuteczność co ma związek najprawdopodobniej z tym, że model jest zbyt złożony do tych danych.
+
+##6. Wnioski
+
+Jak było już wspomniane we wstępie ciężko o modele na tyle skuteczne w tej dziedzinie, że byłoby przy ich pomocy możliwe zarabianie na zakładach bukmacherskich. Z powyższej analizy możemy zauważyć, że dla zadanego problemu żaden z modeli nie wykazał satysfakcjonującej skuteczności. Ponadto modele KNN oraz Random Forest wykazały cechy przeuczenia, co najprawdopodobniej ma związek ze zbyt małą ilością danych bądĹş zbyt dużym poziomem skomplikowania modelu w stosunku do danych. Przy danych dotyczących wydarzeĹ„ sportowych możemy wykazać się Feature Engineering, który może przyczynić się do podniesienia skuteczności modeli. W celu ulepszenia badania oraz być może utworzenia modelu, który pozwoliłby na osiąganie zysków w zakładach bukmacherskich powinno się zwiększyć ilość obserwacji, po przez dodanie większej ilości sezonów czy też lig. Ponadto powinno się rozwarzyć dodanie informacji o składach drużyn oraz statystykach piłkarzy, którzy biorą udział w meczu.
