@@ -10,7 +10,7 @@ The betting market in Poland alone is worth around 5 billion PLN, and hundreds o
 
 The data were mostly downloaded from http://www.football-data.co.uk/scotlandm.php and relate to the 2017/2018 season, and some of them were obtained by means of webscraping. In their basic form, they were not suitable for the creation of models based on them, and therefore they have been processed, which is presented below. Moreover, the betting odds variables have been removed from the variables so that the study is based only on football statistics. There are no missing observations in the data set.
 
-###Webscrapping 
+### Webscrapping 
 
 In order to increase the number of variables, information has been extracted from https://www.fifaindex.com/pl/teams/fifa18_278/?league=50&order=desc on the average overall rating of each team in the Scottish Premier League for the 2017/2018 season. The team names have been adjusted to those in the downloaded file with the remaining variables. Although these are only numbers in the game, they are expertly created and contribute to the quality of the models.
 
