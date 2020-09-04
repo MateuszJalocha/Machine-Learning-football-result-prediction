@@ -14,6 +14,16 @@ The data were mostly downloaded from http://www.football-data.co.uk/scotlandm.ph
 
 In order to increase the number of variables, information has been extracted from https://www.fifaindex.com/pl/teams/fifa18_278/?league=50&order=desc on the average overall rating of each team in the Scottish Premier League for the 2017/2018 season. The team names have been adjusted to those in the downloaded file with the remaining variables. Although these are only numbers in the game, they are expertly created and contribute to the quality of the models.
 
+## Files
+
+The analysis file is made in Polish, but comments in the files with code are in English.
+
+- **Data directory** - you can find there a csv file with match statistics from Scottish Premiership
+- **HTML directory** - knitted file with "ipynb" extension, you can find there results and analysis (polish language)
+- **Images directory** - you can find there plots included in README
+- **ML_MateuszJalocha.Rmd** - project file (can be convrted into for example html file)
+- **Project_ML.R** - project file
+
 ## Main libraries
 
 - **mlr** - Machine Learning
