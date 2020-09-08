@@ -6,6 +6,7 @@ The betting market in Poland alone is worth around 5 billion PLN, and hundreds o
 <img align = "center" src ="Images/ML_randomForest2.png" /> <img align = "center" src ="Images/ML_randomForest.png" />
 </p>
 
+
 ## Data
 
 The data were mostly downloaded from http://www.football-data.co.uk/scotlandm.php and relate to the 2017/2018 season, and some of them were obtained by means of webscraping. In their basic form, they were not suitable for the creation of models based on them, and therefore they have been processed, which is presented below. Moreover, the betting odds variables have been removed from the variables so that the study is based only on football statistics. There are no missing observations in the data set.
