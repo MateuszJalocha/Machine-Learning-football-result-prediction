@@ -35,7 +35,7 @@ The analysis file is made in Polish, but comments in the files with code are in 
 
 - **ggplot2**, **corrplot** - Plots
 
-- **grixExtra**, **kableExtra**, **flextable** - Rmarkdown
+- **gridExtra**, **kableExtra**, **flextable** - Rmarkdown
 
 - **rvest** - Webscrapping
 
